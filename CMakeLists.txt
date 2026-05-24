@@ -37,10 +37,18 @@ endif()
 if(NOT TARGET lsmash)
   include(FetchContent)
 
+  # Vimeo's fork is the actively maintained branch; upstream
+  # l-smash/l-smash has been dormant since 2020. Pinned to v2.18.0.
   FetchContent_Declare(lsmash
-    GIT_REPOSITORY https://github.com/l-smash/l-smash.git
-    GIT_TAG        master
+    GIT_REPOSITORY https://github.com/vimeo/l-smash.git
+    GIT_TAG        v2.18.0
   )
+
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/lsmash_ivf_importer_stub.c"
+"#include \"common/internal.h\"\n"
+"#define LSMASH_IMPORTER_INTERNAL\n"
+"#include \"importer/importer.h\"\n"
+"const importer_functions ivf_importer = { { \"IVF (stub)\", 0 }, 0, 0, 0, 0, 0, 0 };\n")
   FetchContent_GetProperties(lsmash)
   if(NOT lsmash_POPULATED)
     FetchContent_Populate(lsmash)
@@ -74,6 +82,7 @@ if(NOT TARGET lsmash)
     # codecs/
     ${_lsmash_dir}/codecs/a52.c
     ${_lsmash_dir}/codecs/alac.c
+    ${_lsmash_dir}/codecs/av1.c
     ${_lsmash_dir}/codecs/description.c
     ${_lsmash_dir}/codecs/dts.c
     ${_lsmash_dir}/codecs/h264.c
@@ -83,9 +92,15 @@ if(NOT TARGET lsmash)
     ${_lsmash_dir}/codecs/mp4sys.c
     ${_lsmash_dir}/codecs/mp4v.c
     ${_lsmash_dir}/codecs/nalu.c
+    ${_lsmash_dir}/codecs/opus.c
     ${_lsmash_dir}/codecs/qt_wfex.c
     ${_lsmash_dir}/codecs/vc1.c
     ${_lsmash_dir}/codecs/wma.c
+    # NOTE: av1_obu.c + importer/ivf_imp.c require the external
+    # `obuparse` library (vimeo fork's AV1 IVF import path). Skipped
+    # because we never IMPORT raw AV1; description.c's AV1 sample
+    # entry handling is independent of obuparse.
+    "${CMAKE_CURRENT_BINARY_DIR}/lsmash_ivf_importer_stub.c"
     # importer/
     ${_lsmash_dir}/importer/a52_imp.c
     ${_lsmash_dir}/importer/adts_imp.c
