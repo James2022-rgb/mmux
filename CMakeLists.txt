@@ -119,11 +119,13 @@ set(SOURCES_PUBLIC_ROOT_DIR  "${SRC_DIR}/${TARGET_NAME}/public")
 
 set(SOURCES_MMUX_PUBLIC
   ${SOURCES_PUBLIC_ROOT_DIR}/mp4_hevc_video_muxer.h
+  ${SOURCES_PUBLIC_ROOT_DIR}/mp4_muxer.h
 )
 source_group("Public" FILES ${SOURCES_MMUX_PUBLIC})
 
 set(SOURCES_MMUX_PRIVATE
   ${SOURCES_PRIVATE_ROOT_DIR}/mp4_hevc_video_muxer.cpp
+  ${SOURCES_PRIVATE_ROOT_DIR}/mp4_muxer.cpp
 )
 source_group("Private" FILES ${SOURCES_MMUX_PRIVATE})
 
