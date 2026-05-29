@@ -91,6 +91,39 @@ public:
   };
   TrackId AddTimecodeTrack(TimecodeTrackConfig const& config);
 
+  /// Add a track whose entire sample-description box is copied
+  /// verbatim from a source MP4. Useful for codecs L-SMASH already
+  /// recognises (e.g. MJPEG, ProRes via QT codec types) when we
+  /// want bit-exact passthrough without reconstructing the
+  /// `lsmash_summary_t` from individual fields.
+  ///
+  /// Internally opens `source_path` with its own L-SMASH root,
+  /// iterates the source's tracks looking for the first one whose
+  /// sample-entry fourcc matches `codec_fourcc`, and re-uses the
+  /// returned summary to seed the output track. The source root
+  /// stays alive inside the muxer for the rest of the session
+  /// because L-SMASH's summary objects borrow from the root.
+  ///
+  /// `media_handler_name` is written into the output mdia's hdlr
+  /// box. Pass an empty string to use a generic default.
+  ///
+  /// Returns 0 if the source can't be opened or no matching track
+  /// is found.
+  ///
+  /// **Known limitation** -- L-SMASH's public read API drops
+  /// genuinely unknown sample entries (e.g. `gpmd` GoPro
+  /// telemetry, `tmcd` QuickTime timecode) into the parent box's
+  /// `extensions` rather than `stsd->list`, and
+  /// `lsmash_get_summary` returns NULL for entries it can't
+  /// classify as video, audio, or hint. Multiple-file patches
+  /// across read / summary / write paths would be needed to
+  /// unlock those codecs; until that happens this method returns
+  /// 0 for gpmd / tmcd inputs even though they're present in the
+  /// source file.
+  TrackId AddPassthroughTrackByCodec(std::string const& source_path,
+                                     uint32_t codec_fourcc,
+                                     std::string const& media_handler_name = {});
+
   // ---- Sample append --------------------------------------------
 
   /// Appends one sample to `track_id`. `dts` is in the track's own

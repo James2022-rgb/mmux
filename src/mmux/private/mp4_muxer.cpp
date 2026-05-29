@@ -90,6 +90,16 @@ struct Mp4Muxer::Impl final {
   std::vector<TrackState>  tracks;          // index = TrackId - 1
   bool                     closed          = false;
   bool                     failed          = false;
+
+  // Source L-SMASH roots opened by AddPassthroughTrackByCodec.
+  // Held alive for the lifetime of the muxer because the summary
+  // objects we passed into lsmash_add_sample_entry borrow from
+  // them.
+  struct SourceRoot final {
+    lsmash_root_t*           root = nullptr;
+    lsmash_file_parameters_t fp{};
+  };
+  std::vector<SourceRoot>  source_roots;
 };
 
 // ---- Open / dtor -------------------------------------------
@@ -144,11 +154,22 @@ Mp4Muxer::~Mp4Muxer() {
   if (!impl_->closed && !impl_->failed) {
     Close();
   }
+  // Tear down our own output root FIRST: lsmash_finish_movie may
+  // still be reading from passthrough summaries that point into
+  // the source roots. (Close() already finished movie above, but
+  // belt + braces.)
   if (impl_->root != nullptr) {
     lsmash_close_file(&impl_->file_params);
     lsmash_destroy_root(impl_->root);
     impl_->root = nullptr;
   }
+  for (auto& sr : impl_->source_roots) {
+    if (sr.root != nullptr) {
+      lsmash_close_file(&sr.fp);
+      lsmash_destroy_root(sr.root);
+    }
+  }
+  impl_->source_roots.clear();
 }
 
 // ---- AddHevcVideoTrack -------------------------------------
@@ -449,6 +470,132 @@ Mp4Muxer::TrackId Mp4Muxer::AddTimecodeTrack(TimecodeTrackConfig const& config) 
     .lsmash_track_id = track_id,
     .sample_entry    = sample_entry,
     .timescale       = config.timescale,
+  });
+  return static_cast<TrackId>(s.tracks.size());
+}
+
+// ---- AddPassthroughTrackByCodec ----------------------------
+
+Mp4Muxer::TrackId Mp4Muxer::AddPassthroughTrackByCodec(
+  std::string const& source_path,
+  uint32_t codec_fourcc,
+  std::string const& media_handler_name)
+{
+  Impl& s = *impl_;
+  if (s.closed || s.failed) return 0;
+
+  // Open source MP4 with its own L-SMASH root. The root stays alive
+  // for the rest of the muxer's lifetime: lsmash_get_summary returns
+  // a borrowed pointer into the root's internal state, and we hand
+  // that pointer to lsmash_add_sample_entry which keeps reading
+  // from it until lsmash_finish_movie.
+  Impl::SourceRoot sr{};
+  if (lsmash_open_file(source_path.c_str(), 1, &sr.fp) < 0) {
+    MBASE_LOG_ERROR("Mp4Muxer::AddPassthroughTrackByCodec: lsmash_open_file('{}') failed.", source_path);
+    return 0;
+  }
+  sr.root = lsmash_create_root();
+  if (sr.root == nullptr) {
+    MBASE_LOG_ERROR("Mp4Muxer::AddPassthroughTrackByCodec: lsmash_create_root failed.");
+    lsmash_close_file(&sr.fp);
+    return 0;
+  }
+  lsmash_file_t* sfile = lsmash_set_file(sr.root, &sr.fp);
+  if (sfile == nullptr) {
+    MBASE_LOG_ERROR("Mp4Muxer::AddPassthroughTrackByCodec: lsmash_set_file failed.");
+    lsmash_destroy_root(sr.root);
+    lsmash_close_file(&sr.fp);
+    return 0;
+  }
+  lsmash_read_file(sfile, &sr.fp);
+
+  lsmash_movie_parameters_t smp{};
+  if (lsmash_get_movie_parameters(sr.root, &smp) < 0) {
+    MBASE_LOG_ERROR("Mp4Muxer::AddPassthroughTrackByCodec: lsmash_get_movie_parameters failed.");
+    lsmash_destroy_root(sr.root);
+    lsmash_close_file(&sr.fp);
+    return 0;
+  }
+
+  // Find the source track whose first sample-entry's fourcc matches.
+  uint32_t          src_track_id = 0;
+  lsmash_summary_t* src_summary  = nullptr;
+  lsmash_media_type src_handler  = static_cast<lsmash_media_type>(0);
+  uint32_t          src_timescale = 0;
+  for (uint32_t i = 1; i <= smp.number_of_tracks; ++i) {
+    uint32_t const tid = lsmash_get_track_ID(sr.root, i);
+    lsmash_media_parameters_t mdp{};
+    if (lsmash_get_media_parameters(sr.root, tid, &mdp) < 0) continue;
+    uint32_t const sn = lsmash_count_summary(sr.root, tid);
+    for (uint32_t j = 1; j <= sn; ++j) {
+      lsmash_summary_t* sum = lsmash_get_summary(sr.root, tid, j);
+      if (sum != nullptr && sum->sample_type.fourcc == codec_fourcc) {
+        src_track_id  = tid;
+        src_summary   = sum;
+        src_handler   = mdp.handler_type;
+        src_timescale = mdp.timescale;
+        break;
+      }
+    }
+    if (src_summary != nullptr) break;
+  }
+  if (src_summary == nullptr) {
+    MBASE_LOG_ERROR("Mp4Muxer::AddPassthroughTrackByCodec: codec fourcc 0x{:08x} not found in {}",
+      codec_fourcc, source_path);
+    lsmash_destroy_root(sr.root);
+    lsmash_close_file(&sr.fp);
+    return 0;
+  }
+
+  // Create the output track matching the source's handler type +
+  // media timescale.
+  uint32_t const out_track_id = lsmash_create_track(s.root, src_handler);
+  if (out_track_id == 0) {
+    MBASE_LOG_ERROR("Mp4Muxer::AddPassthroughTrackByCodec: lsmash_create_track failed.");
+    lsmash_destroy_root(sr.root);
+    lsmash_close_file(&sr.fp);
+    return 0;
+  }
+  lsmash_track_parameters_t tp{};
+  lsmash_initialize_track_parameters(&tp);
+  tp.mode = static_cast<lsmash_track_mode>(ISOM_TRACK_ENABLED | ISOM_TRACK_IN_MOVIE);
+  if (lsmash_set_track_parameters(s.root, out_track_id, &tp) < 0) {
+    MBASE_LOG_ERROR("Mp4Muxer::AddPassthroughTrackByCodec: lsmash_set_track_parameters failed.");
+    lsmash_destroy_root(sr.root);
+    lsmash_close_file(&sr.fp);
+    return 0;
+  }
+  lsmash_media_parameters_t mp{};
+  lsmash_initialize_media_parameters(&mp);
+  mp.timescale          = src_timescale;
+  std::string const handler_name = media_handler_name.empty()
+    ? std::string{"mmux passthrough"}
+    : media_handler_name;
+  mp.media_handler_name = const_cast<char*>(handler_name.c_str());
+  if (lsmash_set_media_parameters(s.root, out_track_id, &mp) < 0) {
+    MBASE_LOG_ERROR("Mp4Muxer::AddPassthroughTrackByCodec: lsmash_set_media_parameters failed.");
+    lsmash_destroy_root(sr.root);
+    lsmash_close_file(&sr.fp);
+    return 0;
+  }
+
+  uint32_t const sample_entry = lsmash_add_sample_entry(s.root, out_track_id, src_summary);
+  if (sample_entry == 0) {
+    MBASE_LOG_ERROR("Mp4Muxer::AddPassthroughTrackByCodec: lsmash_add_sample_entry failed.");
+    lsmash_destroy_root(sr.root);
+    lsmash_close_file(&sr.fp);
+    return 0;
+  }
+
+  // Track committed -- now we own the source root for the rest of
+  // the session.
+  s.source_roots.push_back(std::move(sr));
+
+  s.tracks.push_back(Impl::TrackState{
+    .kind            = Impl::TrackKind::kGpmd,  // generic-bucket; only used by AppendSample lookup
+    .lsmash_track_id = out_track_id,
+    .sample_entry    = sample_entry,
+    .timescale       = src_timescale,
   });
   return static_cast<TrackId>(s.tracks.size());
 }
